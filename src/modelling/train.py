@@ -1,0 +1,206 @@
+"""
+ML Job entrypoint for HPO training via submit_directory.
+
+Usage (submitted by src/pipelines/training_pipeline.py):
+    submit_directory(payload_dir, pool, entrypoint="modelling/train.py")
+
+The payload contains src/ contents (flattened) + conf/. So modelling/train.py
+is the entrypoint and conf/parameters.yml is available at ./conf/parameters.yml.
+"""
+
+import os
+import sys
+
+import yaml
+
+
+def _ensure_root_on_path():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if root not in sys.path:
+        sys.path.insert(0, root)
+
+
+_ensure_root_on_path()
+
+from snowflake.ml.data.data_connector import DataConnector
+from snowflake.ml.experiment import ExperimentTracking
+# from snowflake.ml.experiment.callback.xgboost import SnowflakeXgboostCallback
+# from snowflake.ml.model.model_signature import infer_signature
+from snowflake.ml.registry import Registry
+from snowflake.snowpark import Session
+
+from modelling.evaluate import evaluate_model
+from modelling.pipeline import build_pipeline
+from modelling.splitter import create_data_connector, generate_train_val_set
+
+
+def _load_conf() -> dict:
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    candidates = [
+        os.path.join(root, "conf", "parameters.yml"),
+        os.path.join(os.getcwd(), "conf", "parameters.yml"),
+    ]
+    for conf_path in candidates:
+        if os.path.exists(conf_path):
+            with open(conf_path) as f:
+                return yaml.safe_load(f)
+    raise FileNotFoundError(f"parameters.yml not found. Tried: {candidates}")
+
+
+def train():
+    from snowflake.ml.modeling import tune
+
+    _ensure_root_on_path()
+
+    conf = _load_conf()
+    modelling = conf["modelling"]
+    target_column = modelling["target_column"]
+
+    session = Session.builder.getOrCreate()
+    tuner_context = tune.get_tuner_context()
+    params = tuner_context.get_hyper_params()
+    dm = tuner_context.get_dataset_map()
+    model_name = params.pop("model_name")
+    mr_schema_name = params.pop("mr_schema_name")
+    experiment_name = params.pop("experiment_name")
+
+    exp = ExperimentTracking(session=session, schema_name=mr_schema_name)
+    exp.set_experiment(experiment_name)
+
+    with exp.start_run() as run:
+        train_data = dm["train"].to_pandas()
+        val_data = dm["val"].to_pandas()
+
+        X_train = train_data.drop(target_column, axis=1)
+        y_train = train_data[target_column]
+        X_val = val_data.drop(target_column, axis=1)
+        y_val = val_data[target_column]
+
+        # sig = infer_signature(X_train, y_train)
+        # SnowflakeXgboostCallback automatically logs intermediate XGBoost checkpoints
+        # during training. It does not support target_platforms or options like
+        # enable_explainability when logging the model. If you don't need those,
+        # you can use it instead of exp.log_model() below.
+        # callback = SnowflakeXgboostCallback(
+        #     exp,
+        #     model_name=model_name,
+        #     model_signature=sig,
+        # )
+        # params["callbacks"] = [callback]
+
+        model = build_pipeline(
+            model_params=params,
+            numerical_columns=modelling["numerical_columns"],
+            categorical_columns=modelling["categorical_columns"],
+            ordinal_columns=modelling["ordinal_columns"],
+            ordinal_categories=modelling["ordinal_categories"],
+        )
+        exp.log_params(params)
+
+        print("Training model...", end="")
+        model.fit(X_train, y_train)
+
+        print("Evaluating model...", end="")
+        metrics = evaluate_model(model, X_val, y_val)
+
+        print("Log metrics...", end="")
+        exp.log_metrics(metrics)
+        metrics["run_name"] = run.name
+
+        exp.log_model(
+            model=model,
+            model_name=model_name,
+            version_name=run.name,
+            sample_input_data=X_train,
+            target_platforms=["WAREHOUSE", "SNOWPARK_CONTAINER_SERVICES"],
+            options={
+                "enable_explainability": True,
+            },
+        )
+
+        mr = Registry(
+            session=session,
+            database_name=session.get_current_database(),
+            schema_name=mr_schema_name,
+        )
+        mv = mr.get_model(model_name).version(run.name)
+        for metric_name, metric_value in metrics.items():
+            if metric_name == "run_name":
+                continue
+            mv.set_metric(metric_name, metric_value)
+        print(f"Metrics set on model version {run.name}")
+
+        tuner_context.report(metrics=metrics, model="model")
+
+
+if __name__ == "__main__":
+    from snowflake.ml.modeling import tune
+    from snowflake.ml.modeling.tune.search import RandomSearch
+
+    conf = _load_conf()
+    modelling = conf["modelling"]
+    compute = conf["compute"]
+    fs = conf["feature_store"]
+    database = conf["snowflake"]["database"]
+
+    session = Session.builder.getOrCreate()
+
+    dataset_fqn = f"{database}.{fs['schema']}.{fs['dataset_name']}"
+
+    print(f"Loading data from {dataset_fqn}...", end="", flush=True)
+    dc = create_data_connector(session, dataset_name=dataset_fqn)
+    df = dc.to_pandas()
+
+    print("Building train/val data")
+    train_df, val_df = generate_train_val_set(
+        df,
+        feature_columns=modelling["feature_columns"],
+        target_column=modelling["target_column"],
+        test_size=modelling.get("test_size", 0.2),
+        random_state=modelling.get("random_state", 42),
+    )
+
+    dataset_map = {
+        "train": DataConnector.from_dataframe(session.create_dataframe(train_df)),
+        "val": DataConnector.from_dataframe(session.create_dataframe(val_df)),
+    }
+
+    hpo_conf = conf.get("hpo", {})
+    search_space = {
+        "mr_schema_name": conf["model_registry"]["schema"],
+        "model_name": modelling["model_name"],
+        "experiment_name": modelling["experiment_name"],
+    }
+    for param_name, candidates in hpo_conf.items():
+        search_space[param_name] = tune.choice(candidates)
+
+    tuner_config = tune.TunerConfig(
+        metric=modelling.get("tuning_metric", "mean_absolute_percentage_error"),
+        mode=modelling.get("tuning_mode", "min"),
+        search_alg=RandomSearch(),
+        num_trials=compute.get("num_trials", 10),
+    )
+
+    tuner = tune.Tuner(
+        train_func=train,
+        search_space=search_space,
+        tuner_config=tuner_config,
+    )
+
+    mr_schema = conf["model_registry"]["schema"]
+    mr_model = modelling["model_name"]
+    mr = Registry(session=session, database_name=database, schema_name=mr_schema)
+    try:
+        mr.get_model(mr_model)
+        print(f"Model {mr_model} already exists — skipping dummy creation")
+    except Exception:
+        from sklearn.linear_model import LinearRegression
+
+        dummy = LinearRegression().fit([[0]], [0])
+        mr.log_model(dummy, model_name=mr_model, version_name="dummy_version", sample_input_data=[[0]])
+        print(f"Pre-created model {mr_model} with dummy_version")
+
+    print("HPO starting")
+    results = tuner.run(dataset_map=dataset_map)
+    print("HPO DONE")
+    print(results.results)
